@@ -1,0 +1,20 @@
+<!--
+  SPDX-FileCopyrightText: 2026 Kerrick Long <me@kerricklong.com>
+  SPDX-License-Identifier: CC-BY-SA-4.0
+-->
+
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Added
+
+- Initial project scaffold from `ruby_quality` (Rakefile, Gemfile, RuboCop pin,
+  Steep, mise, pre-commit, `bin/setup`, `bin/console`, shared rake tasks).
+- Minimal `EbookLibraryManager` namespace with `VERSION` to make `bundle install`
+  and the test gate pass. No domain behavior yet.

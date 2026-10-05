@@ -1,0 +1,128 @@
+require 'fileutils'
+require 'pathname'
+require 'set'
+
+# --- Configuration ---
+SOURCE_DIR = Dir.pwd
+DEST_DIR   = File.expand_path("~/Downloads/sync")
+
+# Lower index = Higher preference
+# I added kepub (Kobo), azw (Kindle), and comic formats (cbz/cbr)
+FORMAT_PREFERENCE = [
+  ".epub", 
+  ".kepub",
+  ".pdf", 
+  ".azw3", 
+  ".azw", 
+  ".mobi", 
+  ".djvu",
+  ".fb2",
+  ".cbz",
+  ".cbr"
+]
+
+# Quick lookup set for valid extensions
+VALID_EXTENSIONS = FORMAT_PREFERENCE.to_set
+
+def format_size(size)
+  return "0 B" if size == 0
+  units = %w[B KB MB GB TB]
+  e = (Math.log(size) / Math.log(1024)).floor
+  s = "%.2f" % (size.to_f / 1024**e)
+  "#{s} #{units[e]}"
+end
+
+def run_sync
+  puts "--- Scanning for best ebook versions... ---"
+  
+  # 1. Gather all files
+  # We glob all files, then filter by our allowed extensions
+  all_files = Dir.glob("**/*").select { |f| File.file?(f) }
+  
+  # 2. Group by "Unique Book ID"
+  #    ID = Full Directory Path + Filename (without extension)
+  #    This ensures "FolderA/Book.epub" and "FolderA/Book.pdf" are grouped,
+  #    but "FolderB/Book.epub" is treated as a separate book.
+  grouped_books = Hash.new { |h, k| h[k] = [] }
+  
+  all_files.each do |file_path|
+    ext = File.extname(file_path).downcase
+    
+    # Skip unwanted formats (.rb, .mp3, .DS_Store, etc)
+    next unless VALID_EXTENSIONS.include?(ext)
+    
+    # Create the key: /path/to/folder/filename_no_ext
+    dir  = File.dirname(file_path)
+    base = File.basename(file_path, ".*") # strips extension
+    key  = File.join(dir, base)
+    
+    grouped_books[key] << file_path
+  end
+
+  if grouped_books.empty?
+    puts "No ebook files found."
+    return
+  end
+
+  # 3. Select the "Best" for each group
+  files_to_copy = []
+  total_bytes = 0
+
+  grouped_books.each do |key, file_list|
+    # Sort files based on their extension's index in FORMAT_PREFERENCE
+    # If extension isn't in list (shouldn't happen due to filter), put it last.
+    best_file = file_list.sort_by do |f| 
+      ext = File.extname(f).downcase
+      FORMAT_PREFERENCE.index(ext) || 999
+    end.first
+    
+    files_to_copy << best_file
+    total_bytes += File.size(best_file)
+  end
+
+  # 4. Dry Run Display
+  puts "\n--- Proposed Copy List ---"
+  puts "Destination: #{DEST_DIR}/"
+  puts "--------------------------"
+  
+  files_to_copy.sort.each do |f|
+    ext = File.extname(f)
+    # Visual indicator of why it was picked if duplicates existed
+    group_key = File.join(File.dirname(f), File.basename(f, ".*"))
+    siblings = grouped_books[group_key].map { |s| File.extname(s) }
+    
+    if siblings.length > 1
+      puts "[BEST of #{siblings.join(', ')}] #{File.basename(f)}"
+    else
+      puts "  #{File.basename(f)}"
+    end
+  end
+  
+  puts "--------------------------"
+  puts "Total Books: #{files_to_copy.length}"
+  puts "Total Size:  #{format_size(total_bytes)}"
+
+  # 5. Prompt
+  print "Proceed with copy? (y/N): "
+  input = gets.chomp.downcase
+
+  if input == 'y'
+    puts "\nCreating directory #{DEST_DIR}..."
+    FileUtils.mkdir_p(DEST_DIR)
+    
+    puts "Copying files..."
+    files_to_copy.each do |src|
+      filename = File.basename(src)
+      dest = File.join(DEST_DIR, filename)
+      
+      # Simple copy (overwrite if exists, preserves timestamps)
+      FileUtils.cp(src, dest, preserve: true)
+    end
+    puts "Done."
+  else
+    puts "Operation cancelled."
+  end
+end
+
+run_sync
+

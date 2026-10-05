@@ -1,0 +1,196 @@
+require 'fileutils'
+require 'shellwords'
+
+# --- Configuration ---
+# Minimum characters a prefix must share to be considered a group
+MIN_PREFIX_LENGTH = 3 
+# Ignore files starting with these (dates, isbns, dotfiles)
+IGNORE_START_PATTERN = /^[^a-zA-Z]/ 
+
+# --- Helper: Move via Finder (iCloud Safe) ---
+def finder_move(file_path, target_folder_path)
+  abs_file = File.expand_path(file_path)
+  abs_folder = File.expand_path(target_folder_path)
+  
+  # Check if file exists to prevent Finder errors
+  return false unless File.exist?(abs_file)
+
+  safe_file = abs_file.gsub('\\', '\\\\').gsub('"', '\"')
+  safe_folder = abs_folder.gsub('\\', '\\\\').gsub('"', '\"')
+
+  osascript_cmd = <<~APPLESCRIPT
+    tell application "Finder"
+      try
+        set theFile to POSIX file "#{safe_file}" as alias
+        set theFolder to POSIX file "#{safe_folder}" as alias
+        move theFile to theFolder
+      on error errMsg
+        log "Error moving file: " & errMsg
+        return false
+      end try
+    end tell
+  APPLESCRIPT
+
+  command = "osascript -e #{Shellwords.escape(osascript_cmd)}"
+  # Suppress output to keep terminal clean, we track success manually
+  system(command, :err => File::NULL)
+end
+
+def title_case(str)
+  str.to_s.gsub(/_|-/, ' ').split.map(&:capitalize).join(' ')
+end
+
+# Calculate longest common starting substring (case insensitive)
+def common_prefix(str1, str2)
+  s1 = str1.downcase
+  s2 = str2.downcase
+  
+  # Loop through characters until mismatch
+  idx = 0
+  while idx < s1.length && idx < s2.length
+    break if s1[idx] != s2[idx]
+    idx += 1
+  end
+  
+  # Return the slice from the ORIGINAL string (preserving first string's casing usually)
+  # but we prefer a clean normalized version for the Folder Name proposal.
+  str1[0...idx]
+end
+
+# Clean up prefix (remove trailing space, dash, underscore)
+def clean_prefix(prefix)
+  # Remove trailing non-word characters
+  clean = prefix.sub(/[^a-zA-Z0-9]+$/, '')
+  clean.strip
+end
+
+def run_grouping
+  puts "--- Grouping Files by Prefix ---"
+  
+  # 1. Gather all files in current dir (non-recursive)
+  files = Dir.glob("*").select { |f| File.file?(f) }
+  
+  # 2. Filter out ISBNs/Dates (non-alpha start) and hidden files
+  valid_files = files.reject { |f| f.match?(IGNORE_START_PATTERN) }
+  
+  # 3. Sort alphabetically (case insensitive) to make clustering easy
+  valid_files.sort_by!(&:downcase)
+
+  if valid_files.empty?
+    puts "No eligible files found (starting with letters)."
+    return
+  end
+
+  # 4. Cluster Logic
+  # We iterate through the sorted list. If File A and File B share a prefix,
+  # we start a "cluster". We keep adding files as long as they share that prefix.
+  
+  processed_files = [] # Keep track of what we've moved/skipped to avoid duplicates
+  i = 0
+  
+  while i < valid_files.length - 1
+    current_file = valid_files[i]
+    
+    # Skip if we already handled this file in a previous loop/cluster
+    if processed_files.include?(current_file)
+      i += 1
+      next
+    end
+
+    # Look ahead to find matches
+    cluster = [current_file]
+    
+    # Determine initial prefix with the neighbor
+    next_file = valid_files[i+1]
+    raw_prefix = common_prefix(current_file, next_file)
+    
+    # Optimization: If prefix matches completely (duplicate file names?), just take it.
+    # Otherwise, clean it up.
+    best_prefix = clean_prefix(raw_prefix)
+
+    # CHECK: Is prefix long enough?
+    if best_prefix.length < MIN_PREFIX_LENGTH
+      i += 1
+      next
+    end
+
+    # Build the cluster: Look ahead as long as files match 'best_prefix'
+    j = i + 1
+    while j < valid_files.length
+      candidate = valid_files[j]
+      
+      # Does this candidate start with the prefix?
+      # We check loosely (case insensitive)
+      if candidate.downcase.start_with?(best_prefix.downcase)
+        cluster << candidate
+        j += 1
+      else
+        break
+      end
+    end
+
+    # If we found a group of 2 or more
+    if cluster.length > 1
+      # --- PROPOSAL STEP ---
+      
+      # Generate a pretty folder name (Title Case)
+      proposed_folder_name = title_case(best_prefix)
+      
+      puts "\n" + ("=" * 40)
+      puts "Found Group: '#{proposed_folder_name}'"
+      cluster.each { |f| puts "  - #{f}" }
+      puts "-" * 40
+      
+      print "Action? [y]es / [n]o / [type_custom_name]: "
+      input = gets.chomp.strip
+      
+      target_folder = nil
+
+      if input.downcase == 'y'
+        target_folder = proposed_folder_name
+      elsif input.downcase == 'n' || input.empty?
+        # Skip
+        puts "Skipped."
+      elsif input.length > 1
+        # Custom Override
+        target_folder = input
+      end
+
+      # --- EXECUTION STEP ---
+      if target_folder
+        # 1. Create Folder
+        unless Dir.exist?(target_folder)
+          Dir.mkdir(target_folder)
+          puts "Created folder: #{target_folder}/"
+        end
+
+        # 2. Move Files via Finder
+        puts "Moving files..."
+        cluster.each do |file|
+          if finder_move(file, target_folder)
+            processed_files << file
+          else
+            puts "  [ERR] Failed to move #{file}"
+          end
+        end
+        
+        # Advance the main loop index by the size of the cluster
+        # (Since we sorted, they are contiguous)
+        i += cluster.length - 1 
+      end
+    end
+
+    i += 1
+  end
+  
+  puts "\n--- Done ---"
+end
+
+# Check Mac Requirement
+unless RUBY_PLATFORM =~ /darwin/
+  puts "ERROR: This script requires macOS for Finder integration."
+  exit
+end
+
+run_grouping
+

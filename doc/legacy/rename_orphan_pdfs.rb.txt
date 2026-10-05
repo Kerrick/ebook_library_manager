@@ -1,0 +1,240 @@
+require 'pdf-reader'
+require 'fileutils'
+require 'shellwords'
+require 'set'
+
+# --- Configuration ---
+SKIP_TITLES = ["Untitled", "Unknown", "Book", "Microsoft Word", "Word Document"]
+SKIP_EXTENSIONS = [".pdf", ".docx", ".doc"]
+MAX_FILENAME_LENGTH = 180
+
+# --- Helper: Finder Rename ---
+def finder_rename(old_path, new_filename)
+  abs_path = File.expand_path(old_path)
+  safe_old = abs_path.gsub('\\', '\\\\').gsub('"', '\"')
+  safe_new = new_filename.gsub('\\', '\\\\').gsub('"', '\"')
+
+  osascript_cmd = <<~APPLESCRIPT
+    tell application "Finder"
+      set theFile to POSIX file "#{safe_old}" as alias
+      set name of theFile to "#{safe_new}"
+    end tell
+  APPLESCRIPT
+
+  system("osascript -e #{Shellwords.escape(osascript_cmd)} > /dev/null 2>&1")
+end
+
+def sanitize_filename(filename)
+  return "" if filename.nil?
+  s = filename.gsub(/[\x00\/\\:\*\?\"<>\|#]/, '_')
+  s.gsub(/[[:cntrl:]]/, '').strip
+end
+
+# --- ENCODING FIXER ---
+# Forces text to valid UTF-8, discarding garbage bytes
+def force_utf8(str)
+  return nil if str.nil?
+  str.to_s.encode('UTF-8', 'binary', invalid: :replace, undef: :replace, replace: '')
+end
+
+# --- REFERENCE RESOLVER ---
+# PDF metadata values can be pointers (References) to other objects.
+# We must dereference them to get the actual string.
+def resolve_metadata(reader, value)
+  return nil if value.nil?
+
+  # If it's a Reference object, look it up in the PDF objects table
+  if value.is_a?(PDF::Reader::Reference)
+    resolve_metadata(reader, reader.objects[value])
+  else
+    force_utf8(value)
+  end
+end
+
+def clean_title(raw_title, first_page_text)
+  return nil if raw_title.nil? || raw_title.strip.empty?
+  
+  if SKIP_EXTENSIONS.any? { |ext| raw_title.downcase.end_with?(ext) }
+    return nil
+  end
+  
+  clean = raw_title.split(/:\s|\s-\s|\s—\s/).first.strip
+  clean = clean.sub(/\s+\([^)]+\)$/, '')
+
+  unless clean.match?(/Edition/i)
+    if first_page_text
+      # Ensure page text is also safe UTF-8
+      safe_text = force_utf8(first_page_text)
+      intro = safe_text.slice(0, 1000)
+      if match = intro.match(/(\d+(?:st|nd|rd|th)|First|Second|Third|Fourth|Fifth)\s+Edition/i)
+        clean = "#{clean}, #{match[0]}"
+      end
+    end
+  end
+
+  clean
+end
+
+def process_author_name(name_str)
+  if name_str.count(',') == 1
+    parts = name_str.split(',').map(&:strip)
+    "#{parts[1]} #{parts[0]}"
+  else
+    name_str
+  end
+end
+
+def format_authors(author_string)
+  return nil if author_string.nil? || author_string.strip.empty?
+
+  raw_strings = []
+  if author_string.match?(/\s(and|&)\s|;|\|/)
+    raw_strings = author_string.split(/,\s*|\s+and\s+|\s+&\s+|;\s*|\|\s*/).map(&:strip).reject(&:empty?)
+  elsif author_string.count(',') > 1
+    raw_strings = author_string.split(',').map(&:strip).reject(&:empty?)
+  else
+    raw_strings = [author_string.strip]
+  end
+
+  final_names = raw_strings.map { |n| process_author_name(n) }.uniq
+
+  case final_names.length
+  when 0 then nil
+  when 1 then final_names[0]
+  when 2 then "#{final_names[0]} and #{final_names[1]}"
+  else "#{final_names[0]} et al."
+  end
+end
+
+$planned_paths = Set.new
+
+def get_unique_path(directory, ideal_filename, original_basename)
+  ext = File.extname(ideal_filename)
+  base = File.basename(ideal_filename, ext)
+  full_path = File.join(directory, ideal_filename)
+  
+  is_collision = $planned_paths.include?(full_path) || (File.exist?(full_path) && !File.identical?(full_path, full_path))
+  
+  unless is_collision
+    $planned_paths.add(full_path)
+    return full_path
+  end
+
+  suffix = original_basename.scan(/[_-]([^_-]+)$/).flatten.first
+  if suffix
+    smart_name = "#{base}_#{suffix}#{ext}"
+    smart_path = File.join(directory, smart_name)
+    unless $planned_paths.include?(smart_path) || (File.exist?(smart_path) && !File.identical?(smart_path, smart_path))
+      $planned_paths.add(smart_path)
+      return smart_path
+    end
+  end
+
+  counter = 1
+  loop do
+    count_name = "#{base}_#{counter}#{ext}"
+    count_path = File.join(directory, count_name)
+    unless $planned_paths.include?(count_path) || (File.exist?(count_path) && !File.identical?(count_path, count_path))
+      $planned_paths.add(count_path)
+      return count_path
+    end
+    counter += 1
+  end
+end
+
+RenameOp = Struct.new(:original_base_display, :src, :dest)
+
+def run_pdf_rescue
+  puts "--- Scanning for Orphan PDFs... ---"
+  
+  plan = []
+  pdf_files = Dir.glob("**/*.pdf")
+
+  pdf_files.each do |pdf_path|
+    directory = File.dirname(pdf_path)
+    filename  = File.basename(pdf_path)
+    base_name = File.basename(pdf_path, ".pdf")
+    
+    if File.exist?(File.join(directory, "#{base_name}.epub"))
+      next 
+    end
+
+    begin
+      reader = PDF::Reader.new(pdf_path)
+      
+      info = reader.info || {}
+      
+      # --- FIX: RESOLVE REFERENCES ---
+      raw_title = resolve_metadata(reader, info[:Title])
+      raw_author = resolve_metadata(reader, info[:Author])
+
+      first_page_text = ""
+      begin
+        # Ensure we treat page text as safe UTF-8 immediately
+        first_page_text = force_utf8(reader.pages.first.text) if reader.pages.any?
+      rescue
+        # Ignore text extraction errors
+      end
+
+      # --- PROCESSING ---
+      title_clean = clean_title(raw_title, first_page_text)
+      
+      if title_clean.nil? || title_clean.length < 3 || SKIP_TITLES.any? { |s| title_clean.include?(s) }
+        next
+      end
+
+      author_string = format_authors(raw_author)
+      new_base_name = author_string ? "#{title_clean} by #{author_string}" : title_clean
+      clean_name = sanitize_filename(new_base_name).slice(0, MAX_FILENAME_LENGTH)
+      
+      new_filename = "#{clean_name}.pdf"
+      new_path = get_unique_path(directory, new_filename, base_name)
+      
+      next if File.expand_path(pdf_path) == File.expand_path(new_path)
+
+      display_base = File.join(directory, base_name)
+      plan << RenameOp.new(display_base, pdf_path, new_path)
+
+    rescue StandardError => e
+      # Log the error but keep going
+      puts "[SKIP - ERR] #{filename}: #{e.class} - #{e.message}"
+    end
+  end
+
+  if plan.empty?
+    puts "No orphan PDFs with valid metadata found to rename."
+    return
+  end
+
+  puts "\n--- Proposed Changes ---"
+  plan.each do |op|
+    puts op.original_base_display
+    puts "    #{File.basename(op.dest)}"
+  end
+  puts "------------------------"
+  puts "Found #{plan.length} PDFs to rename."
+
+  print "Do you want to proceed with Finder renaming? (y/N): "
+  input = gets.chomp.downcase
+
+  if input == 'y'
+    puts "\nApplying changes..."
+    plan.each do |op|
+      if finder_rename(op.src, File.basename(op.dest))
+      else
+        puts "  [ERR] Finder failed to rename #{op.src}"
+      end
+    end
+    puts "Done."
+  else
+    puts "Operation cancelled."
+  end
+end
+
+unless RUBY_PLATFORM =~ /darwin/
+  puts "ERROR: This script requires macOS for Finder integration."
+  exit
+end
+
+run_pdf_rescue
+

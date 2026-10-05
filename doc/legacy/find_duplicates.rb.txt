@@ -1,0 +1,97 @@
+require 'digest'
+require 'find'
+
+# --- Configuration ---
+# Allow a tiny variance in size? usually 0 for exact duplicates.
+# If you suspect iCloud metadata changes modified the size slightly, you could increase this,
+# but for hash matching to work, size usually must be identical anyway.
+SIZE_TOLERANCE = 0 
+
+# Formats to scan
+VALID_EXTENSIONS = [
+  ".epub", ".kepub", ".pdf", ".azw3", ".azw", ".mobi", 
+  ".djvu", ".fb2", ".cbz", ".cbr"
+]
+
+def format_size(size)
+  return "0 B" if size == 0
+  units = %w[B KB MB GB TB]
+  e = (Math.log(size) / Math.log(1024)).floor
+  s = "%.2f" % (size.to_f / 1024**e)
+  "#{s} #{units[e]}"
+end
+
+def find_duplicates
+  puts "--- Scanning for content duplicates (Recursive) ---"
+  
+  files_by_size = Hash.new { |h, k| h[k] = [] }
+  
+  # 1. First Pass: Group by File Size
+  #    This is instant compared to hashing.
+  count = 0
+  Dir.glob("**/*") do |path|
+    next unless File.file?(path)
+    
+    # Filter by extension to keep noise down (optional, remove if you want ALL duplicates)
+    ext = File.extname(path).downcase
+    next unless VALID_EXTENSIONS.include?(ext)
+
+    size = File.size(path)
+    files_by_size[size] << path
+    count += 1
+  end
+
+  puts "Scanned #{count} files."
+  
+  # Filter: Keep only sizes that have > 1 file
+  potential_duplicates = files_by_size.select { |size, paths| paths.length > 1 }
+  
+  if potential_duplicates.empty?
+    puts "No duplicates found based on file size."
+    return
+  end
+
+  puts "Found #{potential_duplicates.length} size collisions. Verifying with MD5 hashes..."
+
+  # 2. Second Pass: Calculate Hashes
+  duplicates = []
+  
+  potential_duplicates.each do |size, paths|
+    # Sub-group by Hash
+    hashes = Hash.new { |h, k| h[k] = [] }
+    
+    paths.each do |path|
+      begin
+        # Calculate MD5 of the file content
+        digest = Digest::MD5.file(path).hexdigest
+        hashes[digest] << path
+      rescue => e
+        puts "[ERR] Could not read #{path}: #{e.message}"
+      end
+    end
+    
+    # Only keep groups where hash collisions occurred
+    hashes.each do |hash, matched_paths|
+      if matched_paths.length > 1
+        duplicates << { size: size, hash: hash, paths: matched_paths }
+      end
+    end
+  end
+
+  # 3. Output
+  if duplicates.empty?
+    puts "No identical duplicates found (Hash verification cleared all size collisions)."
+  else
+    puts "\n--- Confirmed Duplicates ---"
+    duplicates.each_with_index do |dup, index|
+      puts "\nGroup ##{index + 1} [Size: #{format_size(dup[:size])}]"
+      dup[:paths].each do |p|
+        puts "  #{p}"
+      end
+    end
+    puts "\nTotal duplicate sets found: #{duplicates.length}"
+  end
+end
+
+find_duplicates
+

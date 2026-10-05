@@ -1,0 +1,271 @@
+require 'gepub'
+require 'fileutils'
+require 'pathname'
+require 'zip'
+require 'set'
+require 'shellwords' # Required for safe shell command execution
+
+# --- Configuration ---
+SKIP_TITLES = ["Untitled", "Unknown", "Book", ""]
+MAX_FILENAME_LENGTH = 180
+
+# Silence Zip warnings
+Zip.warn_invalid_date = false if defined?(Zip)
+
+# --- Helper Methods ---
+
+def sanitize_filename(filename)
+  return "" if filename.nil?
+  sanitized = filename.gsub(/[\x00\/\\:\*\?\"<>\|#]/, '_')
+  sanitized = sanitized.gsub(/[[:cntrl:]]/, '')
+  sanitized.strip
+end
+
+def extract_content(meta_item)
+  return nil if meta_item.nil?
+  if meta_item.is_a?(Array)
+    return meta_item.map { |m| extract_content(m) }.join(" ")
+  end
+  meta_item.respond_to?(:content) ? meta_item.content : meta_item.to_s
+end
+
+# --- iCLOUD SAFTY: FINDER RENAME ---
+# Instead of File.rename, we tell Finder to do it via AppleScript.
+# This ensures iCloud "sees" the rename event correctly.
+def finder_rename(old_path, new_filename)
+  # 1. Get absolute path (AppleScript needs full paths)
+  abs_path = File.expand_path(old_path)
+  
+  # 2. Escape double quotes for AppleScript string
+  # AppleScript strings use double quotes. We must escape " as \" and \ as \\
+  safe_old_path = abs_path.gsub('\\', '\\\\').gsub('"', '\"')
+  safe_new_name = new_filename.gsub('\\', '\\\\').gsub('"', '\"')
+
+  # 3. Construct the AppleScript command
+  # 'tell application "Finder" to set name of (POSIX file "/path/to/old") to "new_name.epub"'
+  osascript_cmd = <<~APPLESCRIPT
+    tell application "Finder"
+      set theFile to POSIX file "#{safe_old_path}" as alias
+      set name of theFile to "#{safe_new_name}"
+    end tell
+  APPLESCRIPT
+
+  # 4. Execute via command line
+  # We use IO.popen to capture stderr in case Finder complains
+  command = "osascript -e #{Shellwords.escape(osascript_cmd)}"
+  
+  success = system(command)
+  
+  unless success
+    puts "    [Finder Error] Could not rename '#{File.basename(old_path)}'. Check permissions?"
+  end
+  success
+end
+
+def clean_title(book)
+  raw_title = extract_content(book.title)
+  return nil if raw_title.nil?
+
+  clean = raw_title.split(/:\s|\s-\s|\s—\s/).first.strip
+  clean = clean.sub(/\s+\([^)]+\)$/, '')
+
+  unless clean.match?(/Edition/i)
+    desc = extract_content(book.description) rescue nil 
+    if desc
+      intro = desc.slice(0, 500) 
+      if match = intro.match(/(\d+(?:st|nd|rd|th)|First|Second|Third|Fourth|Fifth)\s+Edition/i)
+        clean = "#{clean}, #{match[0]}"
+      end
+    end
+  end
+  clean
+end
+
+def process_author_name(name_str)
+  if name_str.count(',') == 1
+    parts = name_str.split(',').map(&:strip)
+    "#{parts[1]} #{parts[0]}"
+  else
+    name_str
+  end
+end
+
+def format_authors(creators_input)
+  creators = creators_input.is_a?(Array) ? creators_input : [creators_input]
+  creators.compact!
+  return nil if creators.empty?
+
+  authors = creators.select { |c| c.respond_to?(:role) && c.role == 'aut' }
+  authors = creators if authors.empty?
+
+  raw_strings = authors.map { |c| extract_content(c) }.compact.uniq
+
+  final_names = []
+  raw_strings.each do |raw|
+    if raw.match?(/\s(and|&)\s|;|\|/)
+      list = raw.split(/,\s*|\s+and\s+|\s+&\s+|;\s*|\|\s*/).map(&:strip).reject(&:empty?)
+      list.each { |n| final_names << process_author_name(n) }
+    elsif raw.count(',') > 1
+      list = raw.split(',').map(&:strip).reject(&:empty?)
+      list.each { |n| final_names << process_author_name(n) }
+    else
+      final_names << process_author_name(raw)
+    end
+  end
+
+  final_names.uniq!
+
+  case final_names.length
+  when 0 then nil
+  when 1 then final_names[0]
+  when 2 then "#{final_names[0]} and #{final_names[1]}"
+  else "#{final_names[0]} et al."
+  end
+end
+
+$planned_paths = Set.new
+
+def get_unique_path(directory, ideal_filename, original_basename)
+  ext = File.extname(ideal_filename)
+  base = File.basename(ideal_filename, ext)
+  
+  full_path = File.join(directory, ideal_filename)
+  
+  is_collision = $planned_paths.include?(full_path) || (File.exist?(full_path) && !File.identical?(full_path, full_path))
+  
+  unless is_collision
+    $planned_paths.add(full_path)
+    return full_path
+  end
+
+  suffix = original_basename.scan(/[_-]([^_-]+)$/).flatten.first
+
+  if suffix
+    smart_name = "#{base}_#{suffix}#{ext}"
+    smart_path = File.join(directory, smart_name)
+    is_smart_collision = $planned_paths.include?(smart_path) || (File.exist?(smart_path) && !File.identical?(smart_path, smart_path))
+    
+    unless is_smart_collision
+      $planned_paths.add(smart_path)
+      return smart_path
+    end
+  end
+
+  counter = 1
+  loop do
+    count_name = "#{base}_#{counter}#{ext}"
+    count_path = File.join(directory, count_name)
+    is_count_collision = $planned_paths.include?(count_path) || (File.exist?(count_path) && !File.identical?(count_path, count_path))
+    
+    unless is_count_collision
+      $planned_paths.add(count_path)
+      return count_path
+    end
+    counter += 1
+  end
+end
+
+RenameOp = Struct.new(:original_base_display, :epub_src, :epub_dest, :pdf_src, :pdf_dest)
+
+def run_renamer
+  puts "--- Scanning files... ---"
+  
+  plan = []
+  files_found = Dir.glob("**/*.epub")
+
+  files_found.each do |old_path|
+    filename  = File.basename(old_path)
+    directory = File.dirname(old_path)
+    base_name = File.basename(old_path, ".epub")
+
+    begin
+      # --- CRASH GUARD ---
+      book = nil
+      begin
+        original_stderr = $stderr.clone
+        $stderr.reopen(File.new('/dev/null', 'w'))
+        book = GEPUB::Book.parse(File.open(old_path))
+      rescue StandardError, SyntaxError => e
+        $stderr.reopen(original_stderr)
+        puts "[SKIP - PARSE ERROR] '#{filename}'"
+        next
+      ensure
+        $stderr.reopen(original_stderr) unless $stderr.closed?
+      end
+      
+      title_clean = clean_title(book)
+      next if title_clean.nil? || title_clean.empty? || SKIP_TITLES.include?(title_clean)
+
+      author_string = format_authors(book.creator)
+      new_base_name = author_string ? "#{title_clean} by #{author_string}" : title_clean
+      clean_name = sanitize_filename(new_base_name).slice(0, MAX_FILENAME_LENGTH)
+      
+      # Determine unique path
+      new_epub_path = get_unique_path(directory, "#{clean_name}.epub", base_name)
+      next if File.expand_path(old_path) == File.expand_path(new_epub_path)
+
+      # Determine PDF path (if any)
+      old_pdf_path = File.join(directory, "#{base_name}.pdf")
+      new_pdf_path = nil
+
+      if File.exist?(old_pdf_path)
+        unique_base = File.basename(new_epub_path, ".epub")
+        new_pdf_path = File.join(directory, "#{unique_base}.pdf")
+      end
+
+      display_base = File.join(directory, base_name)
+      plan << RenameOp.new(display_base, old_path, new_epub_path, old_pdf_path, new_pdf_path)
+
+    rescue StandardError => e
+      puts "[SKIP - ERROR] #{filename}: #{e.message}"
+    end
+  end
+
+  if plan.empty?
+    puts "No files matched criteria for renaming."
+    return
+  end
+
+  puts "\n--- Proposed Changes ---"
+  plan.each do |op|
+    puts op.original_base_display
+    puts "    #{File.basename(op.epub_dest)}"
+    puts "    #{File.basename(op.pdf_dest)}" if op.pdf_dest
+  end
+  puts "------------------------"
+  puts "Found #{plan.length} books to rename."
+
+  print "Do you want to proceed with Finder/iCloud renaming? (y/N): "
+  input = gets.chomp.downcase
+
+  if input == 'y'
+    puts "\nApplying changes via Finder (this may take a moment per file)..."
+    plan.each do |op|
+      # --- SWAPPED FOR FINDER RENAME ---
+      
+      # 1. Rename ePub
+      new_epub_name = File.basename(op.epub_dest)
+      finder_rename(op.epub_src, new_epub_name)
+      
+      # 2. Rename PDF (if applicable)
+      if op.pdf_dest
+        new_pdf_name = File.basename(op.pdf_dest)
+        # Note: We must rename the PDF *after* the epub, and we must be careful
+        # because the 'old' pdf path is still valid, but Finder needs the handle.
+        finder_rename(op.pdf_src, new_pdf_name)
+      end
+    end
+    puts "Done."
+  else
+    puts "Operation cancelled."
+  end
+end
+
+# Check if we are on macOS
+unless RUBY_PLATFORM =~ /darwin/
+  puts "ERROR: This script requires macOS to perform Finder-aware renaming."
+  exit
+end
+
+run_renamer
+

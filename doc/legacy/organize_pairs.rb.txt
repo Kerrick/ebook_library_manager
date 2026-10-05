@@ -1,0 +1,125 @@
+require 'fileutils'
+require 'shellwords'
+
+# --- Configuration ---
+# Only process if BOTH extensions exist for a given base name
+EXT_A = ".epub"
+EXT_B = ".pdf"
+
+# --- Helper: Move via Finder (iCloud Safe) ---
+def finder_move(file_path, target_folder_path)
+  # Convert to absolute paths
+  abs_file = File.expand_path(file_path)
+  abs_folder = File.expand_path(target_folder_path)
+
+  # Escape for AppleScript
+  safe_file = abs_file.gsub('\\', '\\\\').gsub('"', '\"')
+  safe_folder = abs_folder.gsub('\\', '\\\\').gsub('"', '\"')
+
+  osascript_cmd = <<~APPLESCRIPT
+    tell application "Finder"
+      try
+        set theFile to POSIX file "#{safe_file}" as alias
+        set theFolder to POSIX file "#{safe_folder}" as alias
+        move theFile to theFolder
+      on error errMsg
+        log "Error moving file: " & errMsg
+        return false
+      end try
+    end tell
+  APPLESCRIPT
+
+  command = "osascript -e #{Shellwords.escape(osascript_cmd)}"
+  system(command)
+end
+
+MoveOp = Struct.new(:folder_path, :epub_path, :pdf_path)
+
+def organize_pairs
+  puts "--- Scanning for #{EXT_A} + #{EXT_B} pairs... ---"
+  
+  plan = []
+  
+  # Find all ePubs
+  epub_files = Dir.glob("**/*#{EXT_A}")
+
+  epub_files.each do |epub_path|
+    directory = File.dirname(epub_path)
+    base_name = File.basename(epub_path, EXT_A)
+    
+    # Check for matching PDF
+    pdf_path = File.join(directory, "#{base_name}#{EXT_B}")
+    
+    if File.exist?(pdf_path)
+      # PAIR FOUND!
+      
+      # Define new folder path: ./CurrentDir/BookName/
+      new_folder_path = File.join(directory, base_name)
+      
+      # Safety: Don't try to move if the files are ALREADY inside a folder of that name
+      # (Simple check: is the parent directory name same as the book name?)
+      parent_dir_name = File.basename(directory)
+      if parent_dir_name == base_name
+        # Already organized
+        next
+      end
+
+      plan << MoveOp.new(new_folder_path, epub_path, pdf_path)
+    end
+  end
+
+  if plan.empty?
+    puts "No unorganized pairs found."
+    return
+  end
+
+  # --- Dry Run ---
+  puts "\n--- Proposed Organization ---"
+  plan.each do |op|
+    base = File.basename(op.folder_path)
+    puts "[CREATE] Folder: #{op.folder_path}"
+    puts "    -> Move: #{File.basename(op.epub_path)}"
+    puts "    -> Move: #{File.basename(op.pdf_path)}"
+  end
+  puts "-----------------------------"
+  puts "Found #{plan.length} pairs to organize."
+
+  # --- Confirmation ---
+  print "Proceed with Finder move? (y/N): "
+  input = gets.chomp.downcase
+
+  if input == 'y'
+    puts "\nMoving files..."
+    
+    plan.each do |op|
+      # 1. Create Folder (Ruby is fine for creating folders, iCloud handles creation well)
+      unless Dir.exist?(op.folder_path)
+        FileUtils.mkdir_p(op.folder_path)
+      end
+      
+      # 2. Move ePub (Via Finder)
+      success_epub = finder_move(op.epub_path, op.folder_path)
+      
+      # 3. Move PDF (Via Finder)
+      success_pdf = finder_move(op.pdf_path, op.folder_path)
+      
+      if success_epub && success_pdf
+        puts "[OK] Organized '#{File.basename(op.folder_path)}'"
+      else
+        puts "[ERR] Issue moving files for '#{File.basename(op.folder_path)}'"
+      end
+    end
+    puts "Done."
+  else
+    puts "Operation cancelled."
+  end
+end
+
+# Check Mac Requirement
+unless RUBY_PLATFORM =~ /darwin/
+  puts "ERROR: This script requires macOS for Finder integration."
+  exit
+end
+
+organize_pairs
+
