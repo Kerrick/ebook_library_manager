@@ -14,14 +14,15 @@ RDoc::Task.new do |rdoc|
   rdoc.rdoc_files.exclude("**/*.rbs")
 end
 
-# Pure-Ruby CLI: no Rust extension. See ruby_quality templates for the
-# default Rakefile with RbSys::ExtensionTask if a native extension is
-# added later.
+# Pure-Ruby project: no Rust extension. To add one later, re-scaffold with
+# `bin/scaffold --rust` (see ruby_quality) or vendor the RbSys block back
+# from the ruby_quality Rakefile template.
 
 # Import shared quality tasks (owned by ruby_quality) plus per-repo tasks.
 Dir.glob("tasks/**/*.rake").each { |r| import r }
 
 # Default runs gates only, never fixers.
-# NOTE: Ruby-only repo (no Cargo.toml / ext/): run the Rust-free subset
-# explicitly instead of `lint` / `lint:all`, which includes `lint:rust`.
+# NOTE: Ruby-only default. The shared `lint`/`test` tasks include Rust gates
+# (`lint:rust`, `test:rust`), which no-op without a Cargo.toml; the default
+# below runs the Rust-free subset explicitly instead.
 task default: %w[test:ruby rubocop rubycritic steep reuse:lint]
